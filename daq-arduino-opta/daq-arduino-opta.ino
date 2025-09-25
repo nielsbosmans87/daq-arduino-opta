@@ -2,12 +2,12 @@
 DAQ Arduino Opta - 8-Channel High-Speed ADC Acquisition (Phase 1 MVP)
 
 Notes:
-- Targets Arduino Opta (STM32H747XI). Uses HardwareTimer at 10 kHz per-channel sampler.
+- Targets Arduino Opta (STM32H747XI). Uses STM32 HAL hardware timer for precise frame ticks.
 - Samples 8 channels each tick → 80 kS/s total. Stores to ping-pong buffer; streams over USB serial.
 - Serial Plotter decimation: 100 Hz (every 100th sample batch).
 - Button toggles acquisition; LEDs show RUN/LOG/ERR.
-- This version uses analogRead in a timer callback for portability. For ±50 ns jitter and zero-loss DMA,
-  replace the sampler with HAL TIM-TRGO + ADC scan + DMA double-buffer in Phase 2 (hooks marked TODO_HAL).
+- This version uses analogRead in loop() driven by HAL TIM period-elapsed IRQ. For ±50 ns jitter and
+  zero-loss DMA, Phase 2 will switch to HAL TIM-TRGO + ADC scan + DMA double-buffer (hooks marked TODO_HAL).
 
 Configuration:
 - SERIAL_BAUD: 921600 recommended
@@ -17,7 +17,9 @@ Configuration:
 */
 
 #include <Arduino.h>
-#include <mbed.h>
+extern "C" {
+#include "stm32h7xx_hal.h"
+}
 
 // ----- Pins (adjust if your Opta variant differs)
 static const uint8_t ADC_PINS[8] = {A0, A1, A2, A3, A4, A5, A6, A7};
@@ -61,7 +63,8 @@ static volatile bool     running = false;
 static volatile uint32_t framesTotal = 0;
 static volatile uint32_t missedFrames = 0;
 
-mbed::Ticker samplerTicker;
+// HAL timer (TIM2 chosen as 32-bit general-purpose timer on STM32H7)
+static TIM_HandleTypeDef htim2;
 
 // Button handling
 static uint32_t lastButtonToggleMs = 0;
@@ -74,10 +77,11 @@ static volatile uint32_t pendingTicks = 0; // incremented in ISR, drained in loo
 // Forward decl
 void startAcquisition();
 void stopAcquisition();
-void onTimerTick();
+bool initTimerHAL(uint32_t tick_hz);
 void flushReadyPages();
 void printDiagnostics(bool forceLine = false);
 float rawToVolts(uint16_t raw);
+static inline void processOneFrame();
 
 // ----- Setup
 void setup() {
@@ -107,16 +111,18 @@ void setup() {
     pinMode(ADC_PINS[i], INPUT);
   }
 
-  // Timer setup handled in start/stop via mbed::Ticker at TICK_HZ (one frame per tick)
+  // Timer setup handled in start/stop via HAL TIM2 at TICK_HZ (one frame per tick)
 
   // Banner
-  Serial.println("=== ADC Acquisition: Arduino Opta (Phase 1) ===");
+  Serial.println("=== ADC Acquisition: Arduino Opta (Phase 1 - HAL Timer) ===");
   Serial.print("Baud: "); Serial.println(SERIAL_BAUD);
   Serial.print("Per-channel rate: "); Serial.print(SAMPLE_RATE_HZ); Serial.println(" Hz");
   Serial.print("Frame rate: "); Serial.print(FRAME_RATE_HZ); Serial.println(" fps");
   Serial.print("Decimation: /"); Serial.println(DECIMATION);
   Serial.print("Buffer half size (frames): "); Serial.println(BUFFER_BATCH);
-  Serial.println("Commands: 's' start, 'x' stop, 'pN' select plot channels 0..3, 'h' help");
+  Serial.println("Commands: 's' start, 'x' stop, 'h' help");
+  Serial.println("Timing: HAL TIM2 period-elapsed IRQ → loop() frame process");
+  Serial.println("TODO_HAL: Phase 2 → TIM-TRGO + ADC scan + DMA double-buffer");
 
   // Default: stop, wait for 's'
   stopAcquisition();
@@ -174,10 +180,13 @@ void startAcquisition() {
   running = true;
   interrupts();
 
-  // Attach ticker for periodic sampling; 1.0f / TICK_HZ seconds
-  const float period_s = 1.0f / (float)TICK_HZ;
-  samplerTicker.detach();
-  samplerTicker.attach(mbed::callback(onTimerTick), period_s);
+  // Initialize and start HAL timer at TICK_HZ with period-elapsed interrupt
+  if (!initTimerHAL(TICK_HZ)) {
+#ifdef LEDR
+    digitalWrite(LEDR, HIGH);
+#endif
+    Serial.println("ERROR: Failed to init HAL timer");
+  }
 
 #ifdef LEDG
   digitalWrite(LEDG, HIGH);
@@ -189,7 +198,11 @@ void startAcquisition() {
 }
 
 void stopAcquisition() {
-  samplerTicker.detach();
+  // Stop HAL timer
+  HAL_TIM_Base_Stop_IT(&htim2);
+  HAL_TIM_Base_DeInit(&htim2);
+  __HAL_RCC_TIM2_CLK_DISABLE();
+  HAL_NVIC_DisableIRQ(TIM2_IRQn);
   noInterrupts();
   running = false;
   interrupts();
@@ -203,10 +216,65 @@ void stopAcquisition() {
   Serial.println("Sampling Status: STOPPED");
 }
 
-// ----- Timer ISR: one frame (8 channels) per tick
-void onTimerTick() {
-  if (!running) return;
-  pendingTicks++;   // nothing else in the interrupt
+// ----- HAL TIM callbacks/handlers
+extern "C" void TIM2_IRQHandler(void) {
+  HAL_TIM_IRQHandler(&htim2);
+}
+
+extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim) {
+  if (htim->Instance == TIM2) {
+    if (running) {
+      pendingTicks++;
+    }
+  }
+}
+
+// Initialize TIM2 to generate tick_hz interrupts using HAL
+bool initTimerHAL(uint32_t tick_hz) {
+  if (tick_hz == 0) return false;
+
+  __HAL_RCC_TIM2_CLK_ENABLE();
+
+  // Determine timer clock frequency (TIM2 on APB1)
+  uint32_t timer_clk = HAL_RCC_GetPCLK1Freq();
+  RCC_ClkInitTypeDef clk_cfg;
+  uint32_t flash_latency;
+  HAL_RCC_GetClockConfig(&clk_cfg, &flash_latency);
+  if (clk_cfg.APB1CLKDivider != RCC_HCLK_DIV1) {
+    timer_clk *= 2U;  // Timer clock is doubled when APB prescaler != 1
+  }
+
+  // Use a 1 MHz timer base for easy period math when possible
+  uint32_t desired_base_hz = 1000000U;
+  uint32_t prescaler = (timer_clk / desired_base_hz);
+  if (prescaler == 0) prescaler = 1;
+  prescaler -= 1U;
+
+  uint32_t period = (desired_base_hz / tick_hz);
+  if (period == 0) period = 1;
+  period -= 1U;
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = prescaler;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = period;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.RepetitionCounter = 0;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) {
+    return false;
+  }
+
+  // NVIC configuration
+  HAL_NVIC_SetPriority(TIM2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(TIM2_IRQn);
+
+  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) {
+    return false;
+  }
+
+  return true;
 }
 
 // ----- Convert raw ADC to input volts (0-10V scaled)
