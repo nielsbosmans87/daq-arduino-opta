@@ -1,0 +1,4 @@
+Change to folder in cmd (cd + folder path)
+
+Type:
+python daq_capture.py --duration_ms 5000 --plot

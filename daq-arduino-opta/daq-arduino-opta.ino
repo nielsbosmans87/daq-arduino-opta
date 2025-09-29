@@ -1,25 +1,22 @@
 /*
-DAQ Arduino Opta - 8-Channel High-Speed ADC Acquisition (Phase 1 MVP)
+DAQ Arduino Opta - 8-Channel High-Speed ADC Acquisition (Burst to RAM, then USB Transfer)
 
 Notes:
-- Targets Arduino Opta (STM32H747XI). Uses STM32 HAL hardware timer for precise frame ticks.
-- Samples 8 channels each tick → 80 kS/s total. Stores to ping-pong buffer; streams over USB serial.
-- Serial Plotter decimation: 100 Hz (every 100th sample batch).
-- Button toggles acquisition; LEDs show RUN/LOG/ERR.
-- This version uses analogRead in loop() driven by HAL TIM period-elapsed IRQ. For ±50 ns jitter and
-  zero-loss DMA, Phase 2 will switch to HAL TIM-TRGO + ADC scan + DMA double-buffer (hooks marked TODO_HAL).
+- Targets Arduino Opta (STM32H747XI). Uses mbed::Ticker to pace frame sampling at 10 kHz.
+- Phase model:
+  1) Acquisition: sample 8 channels at 10 kHz into RAM (interleaved uint16 frames)
+  2) Stop
+  3) Transfer: send binary block over USB Serial (magic 'OPTA' + header + raw frames)
+- Button can start/stop; PC can command acquisition via "ACQ <ms>".
 
 Configuration:
 - SERIAL_BAUD: 921600 recommended
 - SAMPLE_RATE_HZ: 10000 (per channel)
-- DECIMATION: 100 (for plotter/diagnostics)
-- BUFFER_BATCH: number of multi-channel frames per half-buffer (adjust for RAM)
+- MAX_SAMPLES: RAM cap to keep stable on Opta mbed core
 */
 
 #include <Arduino.h>
-extern "C" {
-#include "stm32h7xx_hal.h"
-}
+#include <mbed.h>
 
 // ----- Pins (adjust if your Opta variant differs)
 static const uint8_t ADC_PINS[8] = {A0, A1, A2, A3, A4, A5, A6, A7};
@@ -40,12 +37,11 @@ static const uint8_t ADC_PINS[8] = {A0, A1, A2, A3, A4, A5, A6, A7};
 
 // ----- Config
 static const uint32_t SERIAL_BAUD       = 921600;
-static const uint32_t SAMPLE_RATE_HZ    = 5000;    // per channel
-static const uint32_t DECIMATION        = 100;      // 100 Hz visualization
-static const uint16_t BUFFER_BATCH      = 256;      // frames per half-buffer (8 ch per frame)
-static const bool     ENABLE_VOLTS_OUT  = true;     // send computed volts alongside raw
-static const float    DIVIDER_FACTOR    = 0.3034f;  // 0-10V → 0-3.3V internal divider
-static const float    VREF              = 3.3f;     // MCU ref
+static const uint32_t SAMPLE_RATE_HZ    = 5000;   // per channel
+static const uint32_t DECIMATION        = 100;     // for optional diagnostics
+static const bool     ENABLE_VOLTS_OUT  = false;    // not used during burst; PC computes
+static const float    DIVIDER_FACTOR    = 1.0f;  // 0-10V → 0-3.3V internal divider
+static const float    VREF              = 10.0f;     // MCU ref
 static const uint16_t ADC_MAX_COUNTS    = 4095;     // 12-bit default (oversampling emulation optional)
 
 // Derived
@@ -53,35 +49,46 @@ static const uint8_t  NUM_CH            = 8;
 static const uint32_t FRAME_RATE_HZ     = SAMPLE_RATE_HZ; // frames/sec (each frame has 8 samples)
 static const uint32_t TICK_HZ           = FRAME_RATE_HZ;  // one timer tick per frame
 
-// Buffers: ping-pong [2][BUFFER_BATCH][NUM_CH]
-static volatile uint16_t adcBuf[2][BUFFER_BATCH][NUM_CH];
-static volatile uint16_t writeIdx = 0;
-static volatile uint8_t  writePage = 0;
-static volatile bool     pageReady[2] = {false, false};
+// Burst acquisition sizing (segmented heap allocation)
+static const uint32_t BLOCK_SAMPLES     = 2000;    // 2000 frames ≈ 32 KB per block (8 ch × 2B)
 
-static volatile bool     running = false;
+// Segmented RAM buffers allocated before acquisition
+static uint16_t** sampleBlocks = nullptr;   // array of block pointers, each block holds BLOCK_SAMPLES × NUM_CH
+static uint32_t   blockCount = 0;           // number of successfully allocated blocks
+static uint32_t   maxSamplesAllocated = 0;  // blockCount × BLOCK_SAMPLES
+static volatile uint32_t writeIdx = 0;      // frames written so far
+static uint32_t targetSamples = 0;          // frames requested (clamped to available)
+
+enum RunState { IDLE = 0, PRE, ACQ, TRANSFER };
+static volatile RunState runState = IDLE;
 static volatile uint32_t framesTotal = 0;
-static volatile uint32_t missedFrames = 0;
 
-// HAL timer (use TIM6 basic timer to minimize conflicts with mbed/RTOS)
-static TIM_HandleTypeDef htim6;
+// mbed ticker for pacing
+static mbed::Ticker frameTicker;
+
+// LED/phasing
+enum PrePhase { PRE_NONE = 0, PRE_RED_HOLD, PRE_ORANGE_BLINK };
+static volatile bool preAcqActive = false;
+static volatile PrePhase prePhase = PRE_NONE;
+static uint32_t phaseStartMs = 0;
+static uint32_t idleBlinkMs = 0;
+static uint32_t orangeBlinkMs = 0;
 
 // Button handling
 static uint32_t lastButtonToggleMs = 0;
 
 // Diagnostics
-static volatile uint32_t decimCount = 0;
-static volatile uint16_t lastFrame[NUM_CH] = {0};
 static volatile uint32_t pendingTicks = 0; // incremented in ISR, drained in loop()
 
 // Forward decl
-void startAcquisition();
+void startAcquisition(uint32_t duration_ms);
 void stopAcquisition();
-bool initTimerHAL(uint32_t tick_hz);
-void flushReadyPages();
+void onFrameTick();
+void sendBinaryTransfer();
 void printDiagnostics(bool forceLine = false);
-float rawToVolts(uint16_t raw);
 static inline void processOneFrame();
+static bool allocBlocks(uint32_t samplesNeeded);
+static void freeBlocks();
 
 // ----- Setup
 void setup() {
@@ -111,18 +118,14 @@ void setup() {
     pinMode(ADC_PINS[i], INPUT);
   }
 
-  // Timer setup handled in start/stop via HAL TIM2 at TICK_HZ (one frame per tick)
+  // Timer setup handled in start/stop via mbed::Ticker at TICK_HZ
 
   // Banner
-  Serial.println("=== ADC Acquisition: Arduino Opta (Phase 1 - HAL Timer) ===");
+  Serial.println("=== Arduino Opta ADC - Burst RAM Acquisition (Ticker) ===");
   Serial.print("Baud: "); Serial.println(SERIAL_BAUD);
   Serial.print("Per-channel rate: "); Serial.print(SAMPLE_RATE_HZ); Serial.println(" Hz");
-  Serial.print("Frame rate: "); Serial.print(FRAME_RATE_HZ); Serial.println(" fps");
-  Serial.print("Decimation: /"); Serial.println(DECIMATION);
-  Serial.print("Buffer half size (frames): "); Serial.println(BUFFER_BATCH);
-  Serial.println("Commands: 's' start, 'x' stop, 'h' help");
-  Serial.println("Timing: HAL TIM2 period-elapsed IRQ → loop() frame process");
-  Serial.println("TODO_HAL: Phase 2 → TIM-TRGO + ADC scan + DMA double-buffer");
+  Serial.print("Block samples per chunk: "); Serial.println(BLOCK_SAMPLES);
+  Serial.println("Commands: ACQ <ms>  |  x=stop  |  h=help");
 
   // Default: stop, wait for 's'
   stopAcquisition();
@@ -130,17 +133,83 @@ void setup() {
 
 // ----- Loop
 void loop() {
-  // Simple serial command interface (single-key tolerant, no newline required)
+  // Command interface: "ACQ <ms>", 'x' stop, 'h' help
   if (Serial.available()) {
-    int c = Serial.read();
-    if (c == 's') {
-      startAcquisition();
-    } else if (c == 'x') {
-      stopAcquisition();
-    } else if (c == 'h') {
-      Serial.println("Commands: s=start, x=stop, h=help");
-    } else if (c == '\n' || c == '\r') {
-      // ignore
+    String line = Serial.readStringUntil('\n'); line.trim();
+    if (line.length() == 1) {
+      char c = line[0];
+      if (c == 'x') stopAcquisition();
+      else if (c == 'h') {
+        Serial.println("Commands: ACQ <ms>  |  x=stop  |  h=help");
+      }
+    } else if (line.startsWith("ACQ")) {
+      uint32_t ms = 0;
+      int sp = line.indexOf(' ');
+      if (sp > 0) {
+        ms = (uint32_t) line.substring(sp + 1).toInt();
+      }
+      if (ms == 0) ms = 1000; // default 1s
+      startAcquisition(ms);
+    }
+  }
+
+  // LED idle blink: green 0.25s on / 0.25s off when IDLE
+#ifdef LEDG
+#ifdef LEDR
+  if (runState == IDLE) {
+    uint32_t nowBlink = millis();
+    if (nowBlink - idleBlinkMs >= 250) {
+      idleBlinkMs = nowBlink;
+      digitalWrite(LEDG, !digitalRead(LEDG));
+      digitalWrite(LEDR, LOW);
+    }
+  }
+#endif
+#endif
+
+  // Handle pre-acquisition phases
+  if (preAcqActive) {
+    uint32_t now = millis();
+    if (prePhase == PRE_RED_HOLD) {
+#ifdef LEDR
+      digitalWrite(LEDR, HIGH);
+#endif
+#ifdef LEDG
+      digitalWrite(LEDG, LOW);
+#endif
+      if (now - phaseStartMs >= 2000) {
+        prePhase = PRE_ORANGE_BLINK;
+        phaseStartMs = now;
+        orangeBlinkMs = now;
+      }
+    } else if (prePhase == PRE_ORANGE_BLINK) {
+      if (now - orangeBlinkMs >= 250) {
+        orangeBlinkMs = now;
+#ifdef LEDR
+        digitalWrite(LEDR, !digitalRead(LEDR));
+#endif
+#ifdef LEDG
+        digitalWrite(LEDG, !digitalRead(LEDG));
+#endif
+      }
+      if (now - phaseStartMs >= 2000) {
+        // proceed to acquisition start
+#ifdef LEDR
+        digitalWrite(LEDR, LOW);
+#endif
+#ifdef LEDG
+        digitalWrite(LEDG, HIGH);
+#endif
+        preAcqActive = false;
+        // Reset counters and start actual acquisition
+        noInterrupts();
+        writeIdx = 0;
+        framesTotal = 0;
+        pendingTicks = 0;
+        runState = ACQ;
+        interrupts();
+        Serial.print("[START] ACQ "); Serial.print(targetSamples); Serial.println(" frames");
+      }
     }
   }
 
@@ -162,53 +231,53 @@ void loop() {
   interrupts();
 
   while (n--) {
-    if (running) processOneFrame();
+    if (runState == ACQ) processOneFrame();
   }
 
-  flushReadyPages();     // emits DATA,... lines for Python capture
-  // Optional: comment out diagnostics if still too chatty
-  // printDiagnostics(false);
+  if (runState == TRANSFER) {
+    sendBinaryTransfer();
+    runState = IDLE;
+  }
 }
 
 // ----- Acquisition control
-void startAcquisition() {
+void startAcquisition(uint32_t duration_ms) {
+  if (runState != IDLE) stopAcquisition();
+  uint32_t reqSamples = (uint32_t)((uint64_t)duration_ms * FRAME_RATE_HZ / 1000ULL);
+  if (reqSamples == 0) reqSamples = 1;
+  if (!allocBlocks(reqSamples)) {
+    Serial.println("[WARN] Allocation failed; using available RAM blocks if any");
+  }
+  Serial.print("#ALLOC blocks="); Serial.print(blockCount); Serial.print(" maxSamples="); Serial.println(maxSamplesAllocated);
+  targetSamples = (reqSamples > maxSamplesAllocated) ? maxSamplesAllocated : reqSamples;
   noInterrupts();
   writeIdx = 0;
-  writePage = 0;
-  pageReady[0] = pageReady[1] = false;
   framesTotal = 0;
-  missedFrames = 0;
-  decimCount = 0;
-  running = true;
+  runState = PRE;
+  preAcqActive = true;
+  prePhase = PRE_RED_HOLD;
+  phaseStartMs = millis();
   interrupts();
 
-  // Initialize and start HAL timer at TICK_HZ with period-elapsed interrupt
-  if (!initTimerHAL(TICK_HZ)) {
-#ifdef LEDR
-    digitalWrite(LEDR, HIGH);
-#endif
-    Serial.println("ERROR: Failed to init HAL timer");
-  } else {
-    Serial.println("HAL timer started");
-  }
+  const float period_s = 1.0f / (float)TICK_HZ;
+  frameTicker.detach();
+  frameTicker.attach(mbed::callback(onFrameTick), period_s);
 
 #ifdef LEDG
-  digitalWrite(LEDG, HIGH);
+  digitalWrite(LEDG, LOW);
 #endif
 #ifdef LEDR
-  digitalWrite(LEDR, LOW);
+  digitalWrite(LEDR, HIGH); // enter red phase
 #endif
-  Serial.println("Sampling Status: ACTIVE");
+  Serial.print("[START] PRE "); Serial.print(targetSamples); Serial.println(" frames");
 }
 
 void stopAcquisition() {
-  // Stop HAL timer
-  HAL_TIM_Base_Stop_IT(&htim6);
-  HAL_TIM_Base_DeInit(&htim6);
-  __HAL_RCC_TIM6_CLK_DISABLE();
-  HAL_NVIC_DisableIRQ(TIM6_DAC_IRQn);
+  frameTicker.detach();
   noInterrupts();
-  running = false;
+  runState = IDLE;
+  preAcqActive = false;
+  prePhase = PRE_NONE;
   interrupts();
 
 #ifdef LEDG
@@ -217,114 +286,62 @@ void stopAcquisition() {
 #ifdef LEDR
   digitalWrite(LEDR, LOW);
 #endif
-  Serial.println("Sampling Status: STOPPED");
+  Serial.println("[STOP] Idle");
 }
 
-// ----- HAL TIM callbacks/handlers
-extern "C" void TIM6_DAC_IRQHandler(void) {
-  HAL_TIM_IRQHandler(&htim6);
-}
-
-extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim) {
-  if (htim->Instance == TIM6) {
-    if (running) {
-      pendingTicks++;
-    }
+// ----- Ticker callback
+void onFrameTick() {
+  if (runState == ACQ) {
+    pendingTicks++;
   }
-}
-
-// Initialize TIM2 to generate tick_hz interrupts using HAL
-bool initTimerHAL(uint32_t tick_hz) {
-  if (tick_hz == 0) return false;
-
-  __HAL_RCC_TIM6_CLK_ENABLE();
-
-  // Determine timer clock frequency (TIM6 on APB1)
-  uint32_t timer_clk = HAL_RCC_GetPCLK1Freq();
-  RCC_ClkInitTypeDef clk_cfg;
-  uint32_t flash_latency;
-  HAL_RCC_GetClockConfig(&clk_cfg, &flash_latency);
-  if (clk_cfg.APB1CLKDivider != RCC_HCLK_DIV1) {
-    timer_clk *= 2U;  // Timer clock is doubled when APB prescaler != 1
-  }
-
-  // Use a 1 MHz timer base for easy period math when possible
-  uint32_t desired_base_hz = 1000000U;
-  uint32_t prescaler = (timer_clk / desired_base_hz);
-  if (prescaler == 0) prescaler = 1;
-  prescaler -= 1U;
-
-  uint32_t period = (desired_base_hz / tick_hz);
-  if (period == 0) period = 1;
-  period -= 1U;
-
-  htim6.Instance = TIM6;
-  htim6.Init.Prescaler = prescaler;
-  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = period;
-  htim6.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim6.Init.RepetitionCounter = 0;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-
-  if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
-    return false;
-  }
-
-  // NVIC configuration
-  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 15, 0);
-  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
-
-  if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK) {
-    return false;
-  }
-
-  return true;
 }
 
 // ----- Convert raw ADC to input volts (0-10V scaled)
-float rawToVolts(uint16_t raw) {
+// Optional helper kept for PC parity (not used during burst)
+static inline float rawToVoltsLocal(uint16_t raw) {
   float v_mcu = (float)raw * (VREF / ADC_MAX_COUNTS);
   return (v_mcu / DIVIDER_FACTOR);
 }
 
 // ----- Flush ready pages (producer/consumer boundary)
-void flushReadyPages() {
-  static uint8_t readPage = 0;
-  static uint32_t msLastStats = 0;
+// ----- Binary transfer: magic 'OPTA' + header + interleaved raw uint16 frames
+typedef struct __attribute__((packed)) {
+  uint8_t  magic[4];      // 'O','P','T','A'
+  uint16_t version;       // 1
+  uint16_t numChannels;   // 8
+  uint32_t sampleRateHz;  // 10000
+  uint32_t numSamples;    // frames captured
+  float    vref;          // 3.3
+  float    divider;       // 0.3034
+} OptaBinHeader;
 
-  if (!pageReady[readPage]) return;
+void sendBinaryTransfer() {
+  OptaBinHeader hdr;
+  hdr.magic[0] = 'O'; hdr.magic[1] = 'P'; hdr.magic[2] = 'T'; hdr.magic[3] = 'A';
+  hdr.version = 1;
+  hdr.numChannels = NUM_CH;
+  hdr.sampleRateHz = SAMPLE_RATE_HZ;
+  hdr.numSamples = framesTotal;
+  hdr.vref = VREF;
+  hdr.divider = DIVIDER_FACTOR;
 
-  // Timestamp (ms)
-  float t_ms = millis();
+  Serial.write((uint8_t*)&hdr, sizeof(hdr));
 
-  // Output CSV lines: one line per frame in this page
-  // Format: Timestamp_ms, A0_raw, A0_volts, ..., A7_raw, A7_volts
-  for (uint16_t i = 0; i < BUFFER_BATCH; ++i) {
-    Serial.print("DATA,");
-    Serial.print(t_ms, 3); // same timestamp for batch (batch-level stamp)
-    for (uint8_t ch = 0; ch < NUM_CH; ++ch) {
-      uint16_t raw = adcBuf[readPage][i][ch];
-      Serial.print(','); Serial.print(raw);
-      if (ENABLE_VOLTS_OUT) {
-        Serial.print(','); Serial.print(rawToVolts(raw), 4);
-      }
+  // stream interleaved frames
+  if (sampleBlocks && blockCount > 0) {
+    uint32_t remaining = framesTotal;
+    for (uint32_t b = 0; b < blockCount && remaining > 0; ++b) {
+      uint32_t framesInBlock = (remaining > BLOCK_SAMPLES) ? BLOCK_SAMPLES : remaining;
+      Serial.write((uint8_t*)sampleBlocks[b], sizeof(uint16_t) * NUM_CH * framesInBlock);
+      remaining -= framesInBlock;
     }
-    Serial.println();
-    t_ms += 1000.0f / FRAME_RATE_HZ; // approximate per-frame ts if needed by PC side
   }
 
-  pageReady[readPage] = false;
-  readPage ^= 1;
-
-  // Status LED pulse
-  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-
-  // Periodic compact status
-  uint32_t now = millis();
-  if (now - msLastStats > 1000) {
-    msLastStats = now;
-    // printDiagnostics(true);
-  }
+#ifdef LEDB
+  digitalWrite(LEDB, LOW);
+#endif
+  Serial.println(); // newline after binary for safety if opened in text monitor
+  Serial.println("[TRANSFER] Complete");
 }
 
 // ----- Diagnostics line (compact)
@@ -334,51 +351,95 @@ void printDiagnostics(bool forceLine) {
   if (!forceLine && (now - lastMs < 1000)) return;
   lastMs = now;
 
-  Serial.print("# STAT,");  // instead of Serial.print("STAT,");
+  Serial.print("# STAT,");
   Serial.print("Rate_Hz:"); Serial.print(SAMPLE_RATE_HZ);
   Serial.print(",Frames:"); Serial.print(framesTotal);
-  Serial.print(",Missed:"); Serial.print(missedFrames);
-  Serial.print(",Run:"); Serial.print(running ? "1" : "0");
-  Serial.print(",BufHalf:"); Serial.print(BUFFER_BATCH);
-  Serial.print(",Ch:8");
+  Serial.print(",State:"); Serial.print((int)runState);
+  Serial.print(",Target:"); Serial.print(targetSamples);
+  Serial.print(",Ch:"); Serial.print(NUM_CH);
+  Serial.print(",Blocks:"); Serial.print(blockCount);
+  Serial.print(",MaxAvail:"); Serial.print(maxSamplesAllocated);
   Serial.println();
 }
 
 static inline void processOneFrame() {
-  volatile uint16_t* frame = adcBuf[writePage][writeIdx];
-
-  for (uint8_t ch = 0; ch < NUM_CH; ++ch) {
-    uint16_t v = analogRead(ADC_PINS[ch]);
-    frame[ch] = v;
-    lastFrame[ch] = v;
+  uint32_t idx = writeIdx;
+  uint32_t blockIdx = idx / BLOCK_SAMPLES;
+  uint32_t offset = idx % BLOCK_SAMPLES;
+  if (!sampleBlocks || blockIdx >= blockCount) {
+    frameTicker.detach();
+    runState = TRANSFER;
+    return;
   }
-
+  uint16_t* frame = sampleBlocks[blockIdx] + (offset * NUM_CH);
+  for (uint8_t ch = 0; ch < NUM_CH; ++ch) {
+    frame[ch] = (uint16_t)analogRead(ADC_PINS[ch]);
+  }
   writeIdx++;
   framesTotal++;
 
-  // Decimated live stream (100 Hz) for Serial Plotter: A0..A7 in volts
-  decimCount++;
-  if (decimCount >= DECIMATION) {
-    decimCount = 0;
-    for (uint8_t ch = 0; ch < NUM_CH; ++ch) {
-      Serial.print('A'); Serial.print(ch); Serial.print(':');
-      if (ENABLE_VOLTS_OUT) Serial.print(rawToVolts(lastFrame[ch]), 4);
-      else Serial.print(lastFrame[ch]);
-      if (ch < (NUM_CH - 1)) Serial.print(' ');
+  if (framesTotal >= targetSamples) {
+    frameTicker.detach();
+#ifdef LEDB
+    digitalWrite(LEDB, HIGH); // indicate transfer phase
+#endif
+    runState = TRANSFER;
+  }
+}
+
+// ----- Allocation helpers
+static bool allocBlocks(uint32_t samplesNeeded) {
+  // Persistently grow allocation as needed; never free between runs to avoid fragmentation
+  uint32_t neededBlocks = (samplesNeeded + BLOCK_SAMPLES - 1) / BLOCK_SAMPLES;
+  if (neededBlocks == 0) neededBlocks = 1;
+
+  if (!sampleBlocks) {
+    sampleBlocks = (uint16_t**) malloc(sizeof(uint16_t*) * neededBlocks);
+    if (!sampleBlocks) {
+      blockCount = 0;
+      maxSamplesAllocated = 0;
+      return false;
     }
-    Serial.println();
+    for (uint32_t i = 0; i < neededBlocks; ++i) sampleBlocks[i] = nullptr;
+    blockCount = 0;
+    maxSamplesAllocated = 0;
+  } else if (neededBlocks > blockCount) {
+    // grow pointer table
+    uint16_t** newTable = (uint16_t**) realloc(sampleBlocks, sizeof(uint16_t*) * neededBlocks);
+    if (!newTable) {
+      // cannot grow table; proceed with current capacity
+      neededBlocks = blockCount;
+    } else {
+      sampleBlocks = newTable;
+      for (uint32_t i = blockCount; i < neededBlocks; ++i) sampleBlocks[i] = nullptr;
+    }
+  } else {
+    // have enough blocks already
   }
 
-  if (writeIdx >= BUFFER_BATCH) {
-    if (pageReady[writePage]) {
-      missedFrames++;
-#ifdef LEDR
-      digitalWrite(LEDR, HIGH);
-#endif
-    } else {
-      pageReady[writePage] = true;
+  // allocate any missing blocks up to neededBlocks
+  for (uint32_t i = blockCount; i < neededBlocks; ++i) {
+    uint16_t* blk = (uint16_t*) malloc(sizeof(uint16_t) * NUM_CH * BLOCK_SAMPLES);
+    if (!blk) {
+      break;
     }
-    writeIdx = 0;
-    writePage ^= 1;
+    sampleBlocks[blockCount++] = blk;
+    maxSamplesAllocated = blockCount * BLOCK_SAMPLES;
   }
+
+  // If we couldn't reach neededBlocks, still return true if we have at least one block
+  maxSamplesAllocated = blockCount * BLOCK_SAMPLES;
+  return (blockCount > 0);
+}
+
+static void freeBlocks() {
+  if (sampleBlocks) {
+    for (uint32_t i = 0; i < blockCount; ++i) {
+      if (sampleBlocks[i]) free(sampleBlocks[i]);
+    }
+    free(sampleBlocks);
+  }
+  sampleBlocks = nullptr;
+  blockCount = 0;
+  maxSamplesAllocated = 0;
 }
