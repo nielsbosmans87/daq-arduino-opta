@@ -1,187 +1,275 @@
-# DAQ Arduino Opta - 8-Channel High-Speed ADC Acquisition System Requirements
+# STM32H747XI Arduino Opta - 8-Channel High-Speed ADC Acquisition System Requirements (UPDATED)
 
 ## System Overview
-Develop a high-performance, real-time analog data acquisition system using STM32H747XI dual-core microcontroller on Arduino Opta platform for industrial-grade continuous sampling of 8 analog channels.
+Develop a high-performance, real-time analog data acquisition system using STM32H747XI dual-core microcontroller on Arduino Opta platform for industrial-grade burst sampling of 8 analog channels with RAM buffering and USB transfer capability.
+
+## Core Acquisition Flow
+The system operates in three distinct phases:
+
+1. **High-Speed RAM Acquisition Phase**
+   - All 8 channels acquire samples simultaneously at exactly 10 kHz
+   - Samples are stored directly in Opta's RAM memory using DMA
+   - RAM writing must NOT distort sampling timing (hardware-timed acquisition)
+   - Acquisition continues for user-defined duration (typically 1-10 seconds)
+
+2. **Acquisition Stop Phase**
+   - Sampling stops cleanly after predetermined sample count is reached
+   - ADC and DMA operations cease
+   - System prepares for data transfer phase
+
+3. **USB Data Transfer Phase**
+   - Acquired samples are transferred from RAM to laptop via USB serial
+   - Transfer occurs at maximum sustainable USB serial speed
+   - Data format: timestamp, raw ADC values, calculated voltages
+   - No real-time constraints during this phase
 
 ## Hardware Requirements
 
 ### ADC Configuration
 - **Number of Channels**: 8 analog input channels (A0 through A7 - all available Arduino Opta analog pins)
-- **ADC Resolution**: 16-bit (using oversampling) with configurable range in software
+- **ADC Resolution**: 12-bit native resolution (expandable to 16-bit using oversampling)
 - **Input Voltage Range**: 0-10V (Arduino Opta native range with internal voltage divider factor of 0.3034)
-- **Voltage Range Adjustment**: Software-configurable maximum range (e.g., 0-5V, 0-10V via scaling factors)
-- **Input Impedance**: High impedance (>1MΩ) to minimize loading effects  
+- **Voltage Range Adjustment**: Software-configurable maximum range (0-5V, 0-10V via scaling factors)
+- **Input Impedance**: High impedance (>1MΩ) to minimize loading effects
 - **Channel Configuration**: Single-ended inputs
-- **Hardware**: Utilize ADC1, ADC2, and ADC3 in triple simultaneous mode for maximum parallelism
+- **Hardware**: Utilize ADC1, ADC2, and ADC3 in simultaneous mode for maximum parallelism
 - **Internal Processing**: Account for Arduino Opta's internal voltage divider (3.3V max to MCU, 10V max input)
 
 ### Timing Requirements
 - **Sampling Frequency**: Exactly 10.000 kHz per channel
-- **Sampling Mode**: Continuous, simultaneous sampling of all 8 channels
-- **Timing Source**: Hardware-based timing using TIM1 or similar high-resolution timer
-- **Jitter Specification**: Maximum ±50ns timing deviation
-- **Phase Alignment**: All 8 channels must be sampled within ±1 ADC clock cycle
-- **Sample Loss**: Zero tolerance - no missed samples allowed
+- **Sampling Mode**: Burst acquisition - continuous sampling for defined duration, then stop
+- **Timing Source**: Hardware timer (TIM1) triggering ADC conversions via TRGO
+- **Jitter Specification**: Maximum ±50ns timing deviation between samples
+- **Phase Alignment**: All 8 channels sampled simultaneously within ±1 ADC clock cycle
+- **Sample Loss**: Zero tolerance during acquisition phase
+
+### Memory Management Requirements
+- **RAM Buffer Size**: Configurable acquisition duration:
+  - 1 second: 8 channels × 2 bytes × 10,000 samples = 160 kB
+  - 5 seconds: 8 channels × 2 bytes × 50,000 samples = 800 kB
+  - 10 seconds: 8 channels × 2 bytes × 100,000 samples = 1.6 MB
+- **Buffer Structure**: Ping-pong double buffering using DMA circular mode
+- **Memory Protection**: Buffer overflow detection and prevention
+- **Data Integrity**: Sample counter verification and data validation
 
 ### Real-time Performance
 - **Dual-Core Utilization**: 
-  - Cortex-M7: Main processing, data handling, PC communication, real-time calculations
-  - Cortex-M4: Real-time ADC control, timing-critical operations, DMA management
-- **DMA Configuration**: Triple-DMA streams with circular buffer mode and double buffering to prevent data loss
-- **Buffer Management**: Minimum 2-second data buffer (20,000 samples × 8 channels × 2 bytes = 320kB)
-- **Inter-Core Communication**: Shared memory for high-speed data transfer between M7 and M4
+  - **Cortex-M7**: USB communication, data formatting, system control, user interface
+  - **Cortex-M4**: Real-time ADC control, DMA management, precise timing operations
+- **DMA Configuration**: Multi-stream DMA with circular buffer mode for continuous data flow
+- **Inter-Core Communication**: Shared memory regions for status and control data exchange
 
 ## Software Requirements
 
 ### Data Acquisition System (STM32H747XI/Arduino)
 
 #### Core Functionality
-1. **ADC Control**:
-   - Configure ADC1+ADC2 in simultaneous regular conversion mode
-   - Hardware trigger from timer for precise 10kHz sampling
-   - DMA-based data transfer to minimize CPU overhead
-   - Automatic channel sequencing for all 8 channels
+1. **ADC Control System**:
+   - Configure ADC1+ADC2+ADC3 in triple simultaneous mode
+   - Hardware timer trigger (TIM1) for precise 10 kHz sampling
+   - DMA-based data transfer with zero CPU intervention during sampling
+   - Automatic channel sequencing for all 8 channels per trigger event
 
-2. **Data Management**:
-   - Circular buffer implementation with ping-pong buffering
-   - Real-time data integrity checking
-   - Timestamp generation for each sample batch
-   - Buffer overflow protection and reporting
+2. **RAM Buffer Management**:
+   - Pre-allocated static buffers in RAM (avoid dynamic allocation)
+   - Double buffering: one buffer filling while other is being processed
+   - Sample counting and acquisition stop logic
+   - Buffer overflow protection with immediate error indication
 
-3. **User Interface**:
-   - User button (Arduino Opta built-in) for start/stop data logging
-   - LED indicators for system status (sampling active, data logging, error states)
-   - Serial interface for diagnostics and reduced-rate visualization
+3. **Acquisition Control**:
+   - User button (Arduino Opta built-in) to start/stop acquisition cycles
+   - LED status indicators:
+     - **Red LED**: System ready/idle
+     - **Green LED**: Active sampling in progress
+     - **Blue LED**: Data transfer in progress
+     - **Blinking patterns**: Error states
 
-#### Visualization & Diagnostics
-1. **Arduino IDE Serial Plotter Integration**:
-   - Transmit decimated data at 100Hz (every 100th sample)
-   - Format: CSV-style output for up to 4 channels simultaneously
-   - Channel selection capability via serial commands
-   - Real-time plotting of selected channels
+#### Serial Monitor Interface (Diagnostics Only)
+**No Serial Plotter visualization required.** Serial Monitor provides:
 
-2. **Diagnostic Information** (Terminal Window):
+1. **Acquisition Status Messages**:
    ```
-   === ADC Acquisition Diagnostics ===
-   Sampling Rate: 10000.0 Hz (Target: 10000.0 Hz) [±0.01%]
-   Maximum Jitter: ±23 ns (Spec: ±50 ns)
-   Missed Samples: 0 (Total: 1,250,000) [0.000%]
-   Sampling Status: ACTIVE | STOPPED | ERROR
-   Data Logging: ENABLED | DISABLED
-   Buffer Usage: 67.3% (2/3 buffers available)
-   ADC Channels: A0:4095 A1:2048 A2:1024 A3:512 A4:256 A5:128 A6:64 A7:32
-   Input Voltages: 10.00V 5.00V 2.50V 1.25V 0.63V 0.31V 0.16V 0.08V
-   Core Usage: M7:45% M4:23%
-   Temperatures: M7:45°C M4:42°C Ambient:25°C
-   Uptime: 00:02:05.234
-   Data Integrity: OK (CRC errors: 0)
+   === Arduino Opta ADC Acquisition System ===
+   System Ready - Press USER button to start acquisition
+   
+   [START] Acquisition started - 10 seconds @ 10 kHz
+   Channels: 8, Buffer size: 1.6 MB
+   
+   [PROGRESS] Samples acquired: 25,000 (25% complete)
+   [PROGRESS] Samples acquired: 50,000 (50% complete)
+   [PROGRESS] Samples acquired: 75,000 (75% complete)
+   
+   [STOP] Acquisition complete!
+   Total samples per channel: 100,000
+   Total acquisition time: 10.000 seconds
+   Actual sampling rate: 10000.0 Hz
+   Data integrity: OK (0 errors)
+   
+   [TRANSFER] Starting USB data transfer...
+   Transfer rate: 825 kB/s
+   [TRANSFER] Complete! Ready for next acquisition.
    ```
 
-3. **Error Monitoring**:
-   - ADC overrun detection and reporting
-   - DMA error detection
-   - Buffer overflow warnings
-   - Timing deviation alerts
-   - System health monitoring
+2. **System Diagnostics** (available on command):
+   ```
+   === System Status ===
+   Core temperatures: M7: 42°C, M4: 40°C
+   RAM usage: 1.6MB / 1.8MB available (89%)
+   DMA errors: 0
+   Buffer overruns: 0
+   System uptime: 00:15:32
+   Last acquisition: 100,000 samples, no errors
+   ```
+
+3. **Configuration Commands**:
+   ```
+   Commands available:
+   - 'status' - Show system status
+   - 'config' - Show acquisition configuration
+   - 'test' - Run system self-test
+   - 'help' - Show available commands
+   ```
 
 ### PC Data Acquisition Software (Python)
 
 #### Communication Interface
-- **Protocol**: USB Serial (115200 baud minimum, prefer 921600 baud for high data rates)
-- **Data Format**: CSV format with timestamp, raw ADC values, and calculated voltages
-- **Handshaking**: Command/response protocol for reliable data transfer
-- **Flow Control**: Software-based XON/XOFF to prevent data loss
+- **Protocol**: USB Serial (921600 baud minimum for fast data transfer)
+- **Data Format**: Binary transfer for efficiency, with CSV conversion on PC side
+- **Handshaking**: Command/response protocol with ACK/NACK confirmation
+- **Flow Control**: Hardware handshaking (RTS/CTS) to prevent data loss during transfer
 
 #### Python Application Features
-1. **Data Capture**:
-   - Automatic detection of Arduino Opta device
-   - Configurable acquisition duration or continuous mode
-   - Real-time data rate monitoring
-   - Data integrity verification
+1. **Acquisition Control**:
+   - Automatic Arduino Opta device detection
+   - Configure acquisition parameters (duration, channels, voltage ranges)
+   - Remote start/stop acquisition commands
+   - Real-time transfer progress monitoring
 
-2. **Data Storage**:
-   - **Primary Format**: CSV files with headers: `Timestamp_ms, A0_raw, A0_volts, A1_raw, A1_volts, ..., A7_raw, A7_volts`
-   - **Data Precision**: Timestamp in milliseconds (float), ADC raw values (uint16_t), Voltages with 4 decimal places
-   - **File Management**: Automatic file naming with timestamp (e.g., `ADC_Data_20250916_143022.csv`)
-   - **Session Duration**: Optimized for 10-second acquisitions (100,000 samples per channel)
+2. **Data Reception and Storage**:
+   - **Binary Reception**: Raw data received as binary stream for speed
+   - **CSV Conversion**: Automatic conversion to CSV format with headers:
+     ```
+     Timestamp_ms, A0_raw, A0_volts, A1_raw, A1_volts, ..., A7_raw, A7_volts
+     ```
+   - **Data Precision**: 
+     - Timestamp: 0.1ms resolution (float)
+     - ADC raw values: uint16_t (0-4095 for 12-bit)
+     - Voltages: 4 decimal places (0.0001V resolution)
+   - **File Management**: Automatic timestamped files (e.g., `ADC_Data_20250925_143022.csv`)
 
-3. **Real-time Monitoring**:
-   - Live plot of selected channels during acquisition
-   - Data rate and quality indicators
-   - System status display
-   - Buffer level monitoring
+3. **Transfer Performance**:
+   - **Data Rate Calculation**: Real-time transfer rate monitoring
+   - **Progress Indication**: Visual progress bar during large transfers
+   - **Error Detection**: Data integrity verification during transfer
+   - **Retry Logic**: Automatic retry for failed transfers
 
-#### Python Requirements File (requirements.txt):
+#### Python Requirements (requirements.txt):
 ```
 numpy>=1.21.0
-matplotlib>=3.5.0
+matplotlib>=3.5.0  # For optional post-acquisition plotting
 pandas>=1.3.0
 pyserial>=3.5
-tkinter  # Usually included with Python
-scipy>=1.7.0
-datetime  # Built-in Python module
+tkinter  # GUI interface
+scipy>=1.7.0  # For data analysis functions
+tqdm>=4.60.0  # Progress bars
 ```
 
 ## Performance Specifications
 
 ### Timing Performance
-- **Sampling Accuracy**: ±0.01% frequency stability
-- **Channel-to-Channel Skew**: <1 ADC clock cycle (typically <100ns)
-- **Long-term Stability**: <10 ppm drift over 24 hours
-- **Settling Time**: Full-scale step response within 1 sample period
+- **Sampling Accuracy**: ±0.01% frequency stability over acquisition period
+- **Channel-to-Channel Skew**: <100ns (simultaneous sampling via triple ADC mode)
+- **Acquisition Jitter**: <±50ns sample-to-sample timing variation
+- **Stop Precision**: Acquisition stops within ±1 sample of target count
 
 ### Data Throughput
-- **Raw Data Rate**: 160 kB/s (8 channels × 2 bytes × 10 kHz)
-- **CSV Data Rate**: ~400 kB/s including timestamps and voltage calculations  
-- **USB Serial Transfer Rate**: Minimum 460 kB/s sustained (4x overhead margin)
-- **Maximum Recording Time**: 10 seconds per session (typical), unlimited sessions
-- **Buffer Depth**: 2 seconds at full rate (640 kB total)
+- **Acquisition Rate**: 160 kB/s during sampling (8 channels × 2 bytes × 10 kHz)
+- **RAM Storage**: Direct DMA to RAM with zero CPU overhead
+- **USB Transfer Rate**: 
+  - Minimum sustained: 800 kB/s (5x acquisition rate for fast transfer)
+  - Target: 1.5 MB/s for optimal user experience
+- **Maximum Buffer Capacity**: 10 seconds acquisition (1.6 MB total)
 
-## Safety and Reliability Requirements
+### Memory Requirements
+- **Static RAM Allocation**: Pre-allocated buffers to avoid fragmentation
+- **Buffer Overhead**: 10% additional space for safety margins
+- **Stack Usage**: Minimal stack usage during high-speed acquisition
+- **Available RAM**: STM32H747XI has 1MB RAM - system uses ~1.8MB for 10-second acquisition
 
-### Industrial Environment Compliance
-- **Operating Temperature**: -40°C to +85°C
-- **Input Protection**: Overvoltage protection on all analog inputs
-- **ESD Protection**: IEC 61000-4-2 compliance
-- **EMI Immunity**: IEC 61000-4-3 compliance
+## System Operation Modes
 
-### Error Handling
-- **Graceful Degradation**: Continue operation with reduced channels if individual ADC fails
-- **Automatic Recovery**: System restart capability after recoverable error conditions
-- **Data Validation**: Real-time CRC or checksum verification of critical data paths
-- **Buffer Overflow Protection**: Immediate error indication and controlled shutdown
-- **Watchdog Timer**: Independent monitoring of both CPU cores with 1-second timeout
+### Mode 1: Manual Trigger
+- User presses button to start acquisition
+- Fixed duration acquisition (configurable: 1, 5, or 10 seconds)
+- Automatic stop after sample count reached
+- LED indication throughout process
 
-### Diagnostics and Maintenance
-- **Built-in Self Test**: Power-on diagnostics of all subsystems
-- **Calibration Verification**: Periodic accuracy checks
-- **Performance Logging**: Historical performance data storage
-- **Remote Monitoring**: Status reporting via communication interface
+### Mode 2: PC-Controlled
+- Python application sends start command via USB
+- Configurable acquisition duration from PC
+- Real-time status updates to PC during acquisition
+- Automatic data transfer initiation after acquisition complete
 
-## Development and Testing Requirements
+### Mode 3: Continuous Cycle
+- Repeated acquisition cycles with user-defined intervals
+- Automatic file naming with sequential numbering
+- Long-term data logging capability
+- System health monitoring between cycles
 
-### Code Quality Standards
-- **Documentation**: Comprehensive inline comments and API documentation
-- **Coding Standard**: Arduino/STM32 HAL best practices
-- **Version Control**: Git with tagged releases
-- **Testing**: Unit tests for critical functions
+## Safety and Error Handling
 
-### Validation Testing
-- **Accuracy Testing**: Verify against precision signal generator
-- **Stress Testing**: 24-hour continuous operation validation
-- **Performance Testing**: Confirm timing specifications under load
-- **Environmental Testing**: Operation across temperature range
+### Error Detection
+- **Buffer Overflow**: Immediate detection with LED error indication
+- **DMA Errors**: Hardware error detection with automatic recovery
+- **Timing Violations**: Real-time monitoring of sample timing accuracy
+- **Communication Errors**: USB transfer error detection and retry logic
 
-### Deliverables
-1. **Arduino Sketch**: Complete STM32H747XI firmware
-2. **Python Application**: Complete PC-side acquisition software
-3. **Documentation**: User manual, API reference, setup guide
-4. **Test Results**: Performance validation report
-5. **Schematic**: Connection diagram for Arduino Opta setup
+### Error Recovery
+- **Graceful Shutdown**: Clean stop on any critical error
+- **System Reset**: Automatic restart capability after recoverable errors
+- **Data Preservation**: Partial data saved even if acquisition interrupted
+- **Error Logging**: Persistent error history in non-volatile memory
 
-## Optional Enhancements (Future Versions)
+### Industrial Compliance
+- **Operating Temperature**: -40°C to +85°C (Arduino Opta specification)
+- **Input Protection**: Built-in Arduino Opta overvoltage protection
+- **EMI Immunity**: Arduino Opta platform compliance with industrial standards
+- **Power Supply Tolerance**: Wide input voltage range handling
+
+## Development Deliverables
+
+### Code Deliverables
+1. **Arduino Sketch**: Complete STM32H747XI dual-core firmware with:
+   - M7 core: Main control, USB communication, user interface
+   - M4 core: Real-time ADC control and DMA management
+   - HAL-based implementation with Arduino IDE compatibility
+
+2. **Python Application**: Complete PC-side software with:
+   - GUI interface for acquisition control
+   - Automatic device detection and configuration
+   - Data reception and CSV conversion
+   - Real-time progress monitoring
+
+3. **Configuration Tools**: 
+   - Acquisition parameter setup utility
+   - System calibration and test procedures
+   - Performance validation scripts
+
+### Documentation
+1. **User Manual**: Complete setup and operation guide
+2. **Technical Reference**: API documentation and code structure
+3. **Calibration Procedures**: Accuracy verification and adjustment
+4. **Troubleshooting Guide**: Common issues and solutions
+
+### Validation and Testing
+1. **Timing Accuracy Testing**: Oscilloscope verification of 10 kHz sampling
+2. **Data Integrity Testing**: Long-duration acquisition validation
+3. **Performance Benchmarking**: Transfer rate and system resource utilization
+4. **Industrial Environment Testing**: Temperature and EMI compliance verification
+
+## Future Enhancement Possibilities
+- **Multi-Device Synchronization**: Multiple Arduino Opta units with shared timebase
+- **Advanced Triggering**: External trigger sources for event-based acquisition
+- **Real-time Processing**: On-board filtering and analysis during acquisition
 - **Web Interface**: Browser-based monitoring and control
-- **Data Processing**: Real-time FFT analysis and filtering
-- **Multiple Device Support**: Synchronization of multiple Arduino Opta units
-- **Cloud Integration**: Data upload to cloud storage/analysis platforms
-- **Advanced Triggering**: External trigger support for event-based acquisition
+- **Cloud Integration**: Direct data upload to analysis platforms
